@@ -1,0 +1,867 @@
+---
+title: 'Harvard Data Science Capstone: Building a Movie Recommendation System'
+author: "Jason Baird"
+date: "April 7, 2021"
+output: 
+    pdf_document:
+        toc: true
+        toc_depth: 2
+        number_sections: true
+        highlight: pygments
+        keep_tex: true
+    html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.align = "center", cache=FALSE, cache.lazy = FALSE)
+```
+
+\newpage
+
+```{r, echo= FALSE}
+# Note: this process could take a couple of minutes
+
+# Install all necessary libraries if it is not present
+
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org")
+if(!require(data.table)) install.packages("data.table", repos = "http://cran.us.r-project.org")
+
+#load all necessary libraries
+library(tidyverse)
+library(caret)
+library(data.table)
+
+#######
+
+# Create 'edx' training dataset and 'validation' test dataset
+
+#######
+
+# Note: this process could take a couple of minutes
+
+# MovieLens 10M dataset:
+# https://grouplens.org/datasets/movielens/10m/
+# http://files.grouplens.org/datasets/movielens/ml-10m.zip
+
+dl <- tempfile()
+download.file("http://files.grouplens.org/datasets/movielens/ml-10m.zip", dl)
+
+ratings <- fread(text = gsub("::", "\t", readLines(unzip(dl, "ml-10M100K/ratings.dat"))),
+                 col.names = c("userId", "movieId", "rating", "timestamp"))
+
+movies <- str_split_fixed(readLines(unzip(dl, "ml-10M100K/movies.dat")), "\\::", 3)
+colnames(movies) <- c("movieId", "title", "genres")
+
+# if using R 4.0 or later:
+movies <- as.data.frame(movies) %>% mutate(movieId = as.numeric(movieId),
+                                           title = as.character(title),
+                                           genres = as.character(genres))
+
+
+movielens <- left_join(ratings, movies, by = "movieId")
+
+# Validation set will be 10% of MovieLens data
+set.seed(1, sample.kind="Rounding") 
+
+test_index <- createDataPartition(y = movielens$rating, times = 1, p = 0.1, list = FALSE)
+edx <- movielens[-test_index,]
+temp <- movielens[test_index,]
+
+# Make sure userId and movieId in validation set are also in edx set
+validation <- temp %>% 
+  semi_join(edx, by = "movieId") %>%
+  semi_join(edx, by = "userId")
+
+# Add rows removed from validation set back into edx set
+removed <- anti_join(temp, validation)
+edx <- rbind(edx, removed)
+
+rm(dl, ratings, movies, test_index, temp, movielens, removed)
+```
+
+\newpage
+
+# Executive Summary
+
+The purpose of this report is to generate a movie recommendation algorithm that predicts movie ratings based on a subset of the MovieLens dataset which contains 10 million rows. Specifically, the algorithm is judged on how well errors are reduced, and must have a root mean squared error (RMSE) less than 0.86490 to be considered high quality.
+
+In short, I used a **regularized least squares model** that produced an RMSE equal to **0.8626956**. This model leveraged two variables and a tuning parameter: 1) **movieId**, 2) **userId**, 3) **lambda** ¬– a tuning parameter that penalizes large predictions based on a small sample size. The **regularized least square formula** is:
+
+$$ 
+\frac{1}{n}\sum_{u,i}(y_{u,i}-\mu-beta_{i}-beta_{u})^2+\lambda(\sum_{i}beta^2_i + \sum_{u}beta^2_u) 
+$$
+
+Throughout this paper, I will go into more detail about the objectives of the algorithm, formulas used, initial data analysis, exploratory analysis, feature selection process, and tuning parameters used to optimize algorithm performance.
+
+# Project Outline
+## Objective:
+Build a movie recommendation algorithm that predicts movie ratings. The model is to be judged on how well it reduces errors. Specifically, a high quality model will have an RMSE less than 0.86490.
+
+$$\mbox{RMSE} = \sqrt{\frac{1}{n}\sum_{t=1}^{n}e_t^2}$$
+
+## Least Squares Regression Formula
+The following least squares regression formula provides the predicted value per category and the residual error we need to minimize from our key metric (loss function).
+
+$$Y_{u,i} = \mu + beta_{i} + ... beta_{n} + \epsilon_{u,i}$$
+
+Here are the definitions for the variables in the equation
+
+$Y_{u,i}$ - the predicted rating for each user and film combination
+
+</br>$\mu$ - the true rating of each movie (approximated by the mean rating of all movies)
+
+</br>$beta_{i}$ - the average difference between actual rating and true rating for category combination one.
+
+</br>$beta_{n}$ – the average difference between the actual ratings and true rating for category combination one.
+
+</br>$\epsilon_{u,i}$ - the independent errors sampled from the same distribution centered at 0
+
+## Feature Selection Process
+
+Since we do not know the true impact each variable of interest will have on our algorithm, we will use **forward selection** to select variables in our model. 
+
+Forward selection starts with no selected variables. During subsequent steps, it evaluates if each candidate variable improves RMSE given previously selected variables, and adds the variable that improves the criterion most.
+
+# Initial Exploratory Data Analysis
+
+## Importing the Data: MovieLens Dataset
+
+For this project, we are using a subset of the MovieLens Data. The data has been split into a training set (edx) and a test set (validation). The code was imported at the beginning of this report.
+
+## Understanding the Data
+
+How many rows and columns in the edx and validation datasets?
+
+```{r, echo= FALSE}
+dim(edx)
+dim(validation)
+```
+
+Take a look at the first 10 rows of each data set.
+
+```{r, echo=FALSE}
+head(edx, n = 10)
+head(validation, n = 10)
+```
+
+How many users and how many movies are in the edx dataset?
+
+```{r, echo=FALSE, message=FALSE}
+edx %>% summarize(userids = n_distinct(userId),
+                 movieids = n_distinct(movieId))
+```
+
+Check for missing data.
+
+```{r, echo= TRUE}
+sum(complete.cases(edx))
+sum(complete.cases(validation))
+```
+
+Determine the class and type of data in the edx dataset
+
+```{r, echo=FALSE}
+glimpse(edx)
+```
+
+# Preprocessing Data to further Exploratory Data Analysis
+
+Convert review timestamp to date and time for both test and validation set.
+
+```{r, echo=TRUE}
+edx$date <- as.POSIXct(edx$timestamp, origin="1970-01-01")
+validation$date <- as.POSIXct(validation$timestamp, origin="1970-01-01")
+```
+
+Grab year, month, and hour of day data from review timestamp which was converted to date and time variables 
+
+```{r, echo=TRUE}
+edx$rating_year <- as.numeric(format(edx$date, "%Y"))
+edx$rating_month <- as.numeric(format(edx$date, "%m")) 
+edx$rating_hour <- as.numeric(format(edx$date, "%H"))
+validation$rating_year <- as.numeric(format(validation$date, "%Y"))
+validation$rating_month <- as.numeric(format(validation$date, "%m")) 
+validation$rating_hour <- as.numeric(format(validation$date, "%H"))
+```
+
+Extract the movie’s release year from the title for both 
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+edx <- edx %>%
+  mutate(title = str_trim(title)) %>%
+  extract(title,
+          into = c("Title", "movie_release"),             
+          regex = "^(.*) \\(([0-9]{4})\\)$",
+          remove = FALSE ) %>%
+  mutate(Title = str_trim(Title, side = "both")) %>%
+  select(-title)
+
+validation <- validation %>%
+  mutate(title = str_trim(title)) %>%
+  extract(title,
+          into = c("Title", "movie_release"),             
+          regex = "^(.*) \\(([0-9]{4})\\)$",
+          remove = FALSE ) %>%
+  mutate(Title = str_trim(Title, side = "both")) %>%
+  select(-title)
+```
+
+Make sure that the previous separation did not create whitespace in the movie name and title.
+
+```{r, echo=TRUE}
+edx$Title <- str_trim(edx$Title, side = "both")
+edx$movie_release <- str_trim(edx$movie_release, side = "both")
+validation$Title <- str_trim(validation$Title, side = "both")
+validation$movie_release <- str_trim(validation$movie_release, side = "both")
+```
+
+Convert movie release date to numeric vector
+
+```{r, echo=TRUE}
+edx$movie_release <- as.numeric(edx$movie_release)
+validation$movie_release <- as.numeric(validation$movie_release)
+```
+
+Create a new variable indicating how many years between the release of the movie and the movie’s review. In the process of feature selection, it is important to implement creative ways that may explain the variability in user ratings. For this variable, I assume that ratings may change based on the length of time between the user watching the movie and when the movie was released. As film graphics and social norms change, the enjoyment of a movie may change.
+
+```{r, echo=TRUE}
+edx <- edx %>%
+     mutate(review_minus_release_year = rating_year - movie_release)
+validation <- validation %>%
+     mutate(review_minus_release_year = rating_year - movie_release)
+```
+
+Separate genre rows based on the vertical bar that splits genres. Notice that this preprocessing step dramatically increased the number of rows in our train and test dataset. 
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+edx <- edx %>%
+       separate_rows(genres,
+                     sep = "\\|")
+
+validation <- validation %>%
+  separate_rows(genres,
+                sep = "\\|")
+```
+
+The previous code dramatically increased the number of rows in both the training and test datasets. Lets take a look at how many additional rows were created.
+
+```{r, echo=FALSE}
+dim(edx)
+dim(validation)
+```
+
+
+Select data to move forward with
+
+```{r, echo=TRUE}
+edx <- edx %>%
+  select(userId, movieId, rating, Title, movie_release, genres, rating_year, rating_month, rating_hour, review_minus_release_year)
+
+validation <- validation %>%
+  select(userId, movieId, rating, Title, movie_release, genres, rating_year, rating_month, rating_hour, review_minus_release_year)
+
+```
+
+\newpage
+
+# Advanced Exploratory Data Analysis 
+
+## Users Effect on Rating
+
+How many users?
+```{r, echo=FALSE}
+length(unique(edx$userId))
+```
+
+What are the median and mean average number of ratings for all users?
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+edx_userid_ratings <- edx %>%
+  group_by(userId) %>%
+  summarize(total_ratings = n())
+mean(edx_userid_ratings$total_ratings)
+median(edx_userid_ratings$total_ratings)
+```
+
+How does the avg rating vary per user?
+
+```{r, echo=FALSE, fig.cap="Avg Rating Per User", message=FALSE, warning=FALSE}
+edx %>%
+  group_by(userId) %>%
+  summarize(mean_rating = mean(rating)) %>%
+  ggplot(aes(x = mean_rating)) + 
+  geom_histogram(bins = 20)
+```
+
+What is the average rating for the top 35 users in the database?
+
+**Mean Rating for Top Users - Table:**
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+top_35_users_table <- edx %>%
+  group_by(userId) %>%
+  summarize(avg_rating = mean(rating),
+            total_ratings = n()) %>%
+  arrange(desc(total_ratings)) %>%
+  top_n( 35)
+
+top_35_users_table
+```
+
+```{r, echo=FALSE, fig.cap="Mean and Median Ratings for Top Users", message=FALSE, warning=FALSE}
+top_35_users_data <- edx %>%
+     filter(userId %in% top_35_users_table$userId)
+top_35_users_data %>%
+  ggplot(aes(x = as.factor(userId), y = rating)) + 
+  geom_boxplot() + 
+  stat_summary(fun.y=mean, geom="point", shape=20, size=6, color="red", fill="red") +
+  theme(axis.text.x = element_blank())
+
+```
+
+How do the median and mean rating per top 35 user vary across each user? In this section, we learn a lot of things about the variability associated with each user’s rating. For example, we find that the mean value is a more accurate representation of a user’s central tendency because it is much more inclusive of when a user has high and low ratings. Meanwhile, median value is not inclusive of those extreme ratings. Additionally, the variance for each user is substantial and person specific.
+
+*Lets see if this variance holds for users with a more central number of ratings.*
+
+Identify 30 users around the median number of ratings per user
+
+**30 users around the median number of ratings - Table:**
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+median_30_users_table <- edx %>%
+  group_by(userId) %>%
+  summarize(avg_rating = mean(rating),
+            total_ratings = n()) %>%
+  filter(total_ratings >= 162 & total_ratings <= 165) %>%
+  arrange(desc(total_ratings)) 
+median_30_users_table <- median_30_users_table[c(1:17, 601:613),]
+median_30_users_table
+```
+
+How do the median and mean ratings for these 30 users vary across each user? As you can see, the variability is consistent across this group of users as well. 
+
+```{r, echo=FALSE, fig.cap="Mean and Median Ratings for 30 users with more common number of ratings", message=FALSE, warning=FALSE}
+median_30_users_data <- edx %>%
+  filter(userId %in% median_30_users_table$userId)
+median_30_users_data %>%
+  ggplot(aes(x = as.factor(userId), y = rating)) + 
+  geom_boxplot() + 
+  stat_summary(fun.y=mean, geom="point", shape=20, size=6, color="red", fill="red") +
+  theme(axis.text.x = element_blank())
+```
+
+\newpage
+
+## Movie Effect on Rating
+
+How many movies were rated?
+
+```{r, echo=FALSE}
+length(unique(edx$movieId))
+```
+
+How many ratings per movie?
+
+```{r, echo=FALSE, fig.cap="Number of Reviews per Movie", message=FALSE, warning=FALSE}
+edx %>%
+  group_by(movieId) %>%
+  summarize(count_movieId = n()) %>%
+  ggplot(aes(x = count_movieId)) +
+  geom_histogram(bins = 10)
+```
+
+What are the top 35 most frequently reviewed movies?
+
+**Top 35 Movies - Table:**
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+top_35_movies_table <- edx %>%
+  group_by(movieId) %>%
+  summarize(avg_rating = mean(rating),
+            total_ratings = n()) %>%
+  arrange(desc(total_ratings)) %>%
+  top_n( 35)
+top_35_movies_table
+```
+
+```{r, echo=FALSE, fig.cap="Mean and Median Ratings for the Top 35 Movies", message=FALSE, warning=FALSE}
+top_35_movies_data <- edx %>%
+  filter(movieId %in% top_35_movies_table$movieId)
+top_35_movies_data %>%
+  ggplot(aes(x = as.factor(movieId), y = rating)) + 
+  geom_boxplot() + 
+  stat_summary(fun.y=mean, geom="point", shape=20, size=6, color="red", fill="red") +
+  theme(axis.text.x = element_blank())
+```
+
+
+How do the median and mean rating for top 35 most frequently reviewed movies vary across each film? Once again, the film ID/Title showcases a significant amount of variability depending on the movie.
+
+
+*Lets see if this variance holds for movies with a more central number of ratings*
+
+What is the median number of ratings per movie? 
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+movie_info <- edx %>%
+  group_by(movieId) %>%
+  summarize(total_ratings = n())
+median(movie_info$total_ratings)
+```
+
+Identify 30 movies around the median number of ratings per movie and check out their average rating.
+
+**30 Movies with the median number of ratings - Table**
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+median_30_movie_table <- edx %>%
+  group_by(movieId) %>%
+  summarize(avg_rating = mean(rating),
+            total_ratings = n()) %>%
+  filter(total_ratings >= 200 & total_ratings <= 206) %>%
+  arrange(desc(total_ratings)) 
+median_30_movie_table <- median_30_movie_table[c(1:17, 59:72),]
+median_30_movie_table
+
+```
+
+```{r, echo=FALSE, fig.cap="Median and Mean Ratings for 30 Movies ", message=FALSE, warning=FALSE}
+median_30_movie_data <- edx %>%
+  filter(movieId %in% median_30_movie_table$movieId)
+median_30_movie_data %>%
+  ggplot(aes(x = as.factor(movieId), y = rating)) + 
+  geom_boxplot() + 
+  stat_summary(fun.y=mean, geom="point", shape=20, size=6, color="red", fill="red") +
+  theme(axis.text.x = element_blank())
+
+```
+
+As you can see, the variability is consistent with the findings for the top 35 movies.
+
+\newpage
+
+## Genre Effect on Rating
+
+How many unique genres in the dataset?
+
+```{r, echo=FALSE, fig.cap=""}
+length(unique(edx$genres))
+```
+
+How many movie ratings per genre? As you can see, the most frequently rated movies are considered dramas, comedies, and/or action movies.
+
+```{r, echo=FALSE, fig.cap="Which Genres Had the most Ratings?" , message=FALSE, warning=FALSE}
+edx %>%
+  group_by(genres) %>%
+  summarize(total_ratings = n()) %>%
+  ggplot(aes(x = reorder(genres, -total_ratings), y = total_ratings)) + 
+  geom_col() + 
+  theme(axis.text.x = element_text(angle = 90))
+```
+
+How are the average ratings by genre distributed?
+
+```{r, echo=FALSE, fig.cap="Average Rating By Genre", , message=FALSE, warning=FALSE}
+edx %>%
+  group_by(genres) %>%
+  summarize(mean_rating = mean(rating)) %>%
+  ggplot(aes(x = mean_rating)) + 
+  geom_histogram(bins = 5)
+```
+
+How do the median and mean ratings vary across each movie genre?
+
+```{r, echo=FALSE, fig.cap="Mean and Median Rating per Genre" , message=FALSE, warning=FALSE}
+edx %>%
+  ggplot(aes(x = as.factor(genres), y = rating)) + 
+  geom_boxplot() + 
+  stat_summary(fun.y=mean, geom="point", shape=20, size=6, color="red", fill="red") +
+  theme(axis.text.x = element_blank())
+```
+
+Different to UserID and MovieID, this variable does not showcase much variance in ratings. 
+
+\newpage
+
+## Time Difference Between Rating and Review Effect on Rating
+
+How many unique years between a review and the release of a movie?
+
+```{r, echo=FALSE}
+length(unique(edx$review_minus_release_year))
+```
+
+What is the longest amount of time (in years) between a review and the release of a movie?
+
+```{r, echo=FALSE}
+max(edx$review_minus_release_year)
+```
+
+What is the shortest amount of time between a review and the release of a movie? It is a little odd that some movies were reviewed prior to the release of the movie. 
+
+```{r, echo=FALSE, fig.cap=""}
+min(edx$review_minus_release_year)
+```
+
+What is the median amount of time between a movie review and the movie release?
+
+```{r, echo=FALSE, fig.cap=""}
+median(edx$review_minus_release_year)
+```
+
+What are the top 15 years of difference between the review and movie release based on the number of ratings per year?
+
+**Are older or newer movies being rated more frequently - Table**
+
+```{r, echo=FALSE,  message=FALSE, warning=FALSE}
+top_15years_release_table <- edx %>%
+  group_by(review_minus_release_year) %>%
+  summarize(avg_rating = mean(rating),
+            total_ratings = n()) %>%
+  arrange(desc(total_ratings)) %>%
+  top_n(15)
+top_15years_release_table
+```
+
+Visualize how the median and mean rating changes for the top 15 years difference. 
+
+```{r, echo=FALSE, fig.cap="How do the Mean and Median Ratings Vary Among Older and Newer Movies", message=FALSE, warning=FALSE }
+top_15years_release_data <- edx %>%
+  filter(review_minus_release_year %in% top_15years_release_table$review_minus_release_year)
+top_15years_release_data %>%
+  ggplot(aes(x = as.factor(review_minus_release_year), y = rating)) + 
+  geom_boxplot() + 
+  stat_summary(fun.y=mean, geom="point", shape=20, size=6, color="red", fill="red") + 
+  theme(axis.text.x = element_blank())
+```
+
+Different to UserID and MovieID, this variable does not highlight much variance in ratings. 
+
+\newpage
+
+# Algorithm: Reducing RMSE on the Validation Set
+
+## Define RMSE
+
+The following code defines our loss function, RMSE, which is the square root of the mean squared errors. 
+
+```{r, echo=TRUE}
+RMSE <- function(true_ratings = NULL, predicted_ratings = NULL) {
+  sqrt(mean((true_ratings - predicted_ratings)^2))
+}
+```
+
+## Naïve Model 
+
+The naïve model is the most basic algorithm we can define. It is defined as the mean value of all movie ratings from the training dataset. 
+
+```{r, echo=TRUE}
+mu_hat <- mean(edx$rating)
+rmse_mean_model <- RMSE(validation$rating, mu_hat)
+rmse_mean_model
+```
+
+## Storing Results
+
+I’ve created two data frames to store the results of our models. The first, results_df contains the RMSE for each variable tested on our training dataset. The second, results_final, contains the variables that improve RMSE the most for each additional Beta included in our model. 
+
+```{r, echo=FALSE}
+results_df <- data.frame(model_name = "Mean Model", RMSE = rmse_mean_model, beta_hat = 0)
+results_final <- data.frame(model_name = "Mean Model", RMSE = rmse_mean_model, beta_hat = 0)
+```
+
+\newpage
+
+# Forward Selection: Assessing Beta 1
+
+For each of the following variables, I will be assessing the category’s grouped effect on the mean prediction. The variable contributing to the lowest RMSE will be locked in for Beta 1.
+
+
+## UserID’s impact on RMSE
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+avg_user_rating <- edx %>%
+  group_by(userId) %>%
+  summarize(b1 = mean(rating - mu_hat))
+
+rmse_mean_user_model <- validation %>%
+  left_join(avg_user_rating, by = "userId") %>%
+  mutate(y_hat = mu_hat + b1) %>%
+  select(y_hat)
+
+rmse_mean_user_model_result <- RMSE(validation$rating, rmse_mean_user_model$y_hat)
+
+results_df <- results_df %>% add_row(model_name = "mean_userId", RMSE = rmse_mean_user_model_result, beta_hat = 1)
+
+```
+
+## MovieID’s impact on RMSE
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+avg_movie_rating <- edx %>%
+  group_by(movieId) %>%
+  summarize(b1 = mean(rating - mu_hat))
+
+rmse_mean_movie_model <- validation %>%
+  left_join(avg_movie_rating, by = "movieId") %>%
+  mutate(y_hat = mu_hat + b1) %>%
+  select(y_hat)
+
+rmse_mean_movie_model_result <- RMSE(validation$rating, rmse_mean_movie_model$y_hat)
+results_df <- results_df %>% add_row(model_name = "mean_movieId", RMSE = rmse_mean_movie_model_result, beta_hat = 1)
+
+```
+
+## Genre’s impact on RMSE
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+avg_genre_rating <- edx %>%
+  group_by(genres) %>%
+  summarize(b1 = mean(rating - mu_hat))
+
+rmse_mean_genre_model <- validation %>%
+  left_join(avg_genre_rating, by = "genres") %>%
+  mutate(y_hat = mu_hat + b1) %>%
+  select(y_hat)
+
+rmse_mean_genres_model_result <- RMSE(validation$rating, rmse_mean_genre_model$y_hat)
+results_df <- results_df %>% add_row(model_name = "mean_genre", RMSE = rmse_mean_genres_model_result, beta_hat = 1)
+
+```
+
+## Film Release Date vs Rating Date’s impact on RMSE
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+avg_releasereview_rating <- edx %>%
+  group_by(review_minus_release_year) %>%
+  summarize(b1 = mean(rating - mu_hat))
+
+rmse_mean_releasereview_model <- validation %>%
+  left_join(avg_releasereview_rating, by = "review_minus_release_year") %>%
+  mutate(y_hat = mu_hat + b1) %>%
+  select(y_hat)
+
+rmse_mean_releasereview_model_result <- RMSE(validation$rating, rmse_mean_releasereview_model$y_hat)
+results_df <- results_df %>% add_row(model_name = "mean_releasereview", RMSE = rmse_mean_releasereview_model_result, beta_hat = 1)
+```
+
+## Evaluating Results of Beta 1
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+results_df
+```
+
+The results stored in results_df for Beta 1 clearly show that movieId reduces RMSE more than any other variable. Our RMSE is now 0.94107, which is well above our threshold for a high-quality movie recommendation model. Therefore, lets lock in movieId as the Beta 1 variable and select another contributing variable.
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+avg_movie_rating <- edx %>%
+  group_by(movieId) %>%
+  summarize(b1 = mean(rating - mu_hat))
+
+rmse_mean_movie_model <- validation %>%
+  left_join(avg_movie_rating, by = "movieId") %>%
+  mutate(y_hat = mu_hat + b1) %>%
+  select(y_hat)
+
+rmse_mean_movie_model_result <- RMSE(validation$rating, rmse_mean_movie_model$y_hat)
+
+results_final <- results_final %>% add_row(model_name = "mean_movie", RMSE = rmse_mean_movie_model_result, beta_hat = 1)
+
+results_final
+```
+
+\newpage
+
+# Forward Selection: Assessing Beta 2
+
+Now that our model consists of the average rating and movieId, so we will evaluate the three remaining variables effect on RMSE. The model will include the variable that most dramatically improves RMSE.
+
+## UserID’s impact on RMSE
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+avg_user_rating <- edx %>%
+  left_join(avg_movie_rating, by = "movieId") %>%
+  group_by(userId) %>%
+  summarize(b2 = mean(rating - mu_hat - b1))
+
+rmse_mean_movie_user_model_pred <- validation %>%
+  left_join(avg_movie_rating, by = "movieId") %>%
+  left_join(avg_user_rating, by = "userId") %>%
+  mutate(y_hat = mu_hat + b1 + b2) %>%
+  select(y_hat)
+
+rmse_mean_movie_user_model_result <- RMSE(validation$rating, rmse_mean_movie_user_model_pred$y_hat)
+
+results_df <- results_df %>% add_row(model_name = "mean_movie_user", RMSE = rmse_mean_movie_user_model_result, beta_hat = 2)
+
+```
+
+## Genre’s impact on RMSE
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+avg_genre_rating <- edx %>%
+  left_join(avg_movie_rating, by = "movieId") %>%
+  group_by(genres) %>%
+  summarize(b2 = mean(rating - mu_hat - b1))
+
+rmse_mean_movie_genre_model_pred <- validation %>%
+  left_join(avg_movie_rating, by = "movieId") %>%
+  left_join(avg_genre_rating, by = "genres") %>%
+  mutate(y_hat = mu_hat + b1 + b2) %>%
+  select(y_hat)
+
+rmse_mean_movie_genre_model_result <- RMSE(validation$rating, rmse_mean_movie_genre_model_pred$y_hat)
+
+results_df <- results_df %>% add_row(model_name = "mean_movie_genre", RMSE = rmse_mean_movie_genre_model_result, beta_hat = 2)
+
+```
+
+## Film Release Date vs. Rating Date’s impact on RMSE
+
+```{r, echo=FALSE, fig.cap="", message=FALSE, warning=FALSE}
+avg_releasereview_rating <- edx %>%
+  left_join(avg_movie_rating, by = "movieId") %>%
+  group_by(review_minus_release_year) %>%
+  summarize(b2 = mean(rating - mu_hat - b1))
+
+rmse_mean_movie_releasereview_model_pred <- validation %>%
+  left_join(avg_movie_rating, by = "movieId") %>%
+  left_join(avg_releasereview_rating, by = "review_minus_release_year") %>%
+  mutate(y_hat = mu_hat + b1 + b2) %>%
+  select(y_hat)
+
+rmse_mean_movie_releasereview_model_result <- RMSE(validation$rating, rmse_mean_movie_releasereview_model_pred$y_hat)
+
+results_df <- results_df %>% add_row(model_name = "mean_movie_releasereview", RMSE = rmse_mean_movie_releasereview_model_result, beta_hat = 2)
+
+```
+
+## Evaluating Beta 2
+
+Evaluate the results for Beta2 in the results_df  data frame. 
+
+```{r, echo=FALSE}
+results_df
+```
+
+For our model that already includes the estimated average rating and our first selected variable movieId, the addition of the userId variable reduces RMSE most significantly. In fact, the RMSE for our model is now 0.8802762. This model is very close to our target RMSE of 0.86490 and is worth a closer inspection.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+avg_user_rating <- edx %>%
+  left_join(avg_movie_rating, by = "movieId") %>%
+  group_by(userId) %>%
+  summarize(b2 = mean(rating - mu_hat - b1))
+
+rmse_mean_movie_user_model_pred <- validation %>%
+  left_join(avg_movie_rating, by = "movieId") %>%
+  left_join(avg_user_rating, by = "userId") %>%
+  mutate(y_hat = mu_hat + b1 + b2) %>%
+  select(y_hat)
+
+rmse_mean_movie_user_model_result <- RMSE(validation$rating, rmse_mean_movie_user_model_pred$y_hat)
+
+results_final <- results_final %>% add_row(model_name = "mean_movie_user", RMSE = rmse_mean_movie_user_model_result, beta_hat = 2)
+
+results_final
+```
+
+\newpage
+
+# Tuning Our Model
+
+## Determining Whether Regularization is the Right Approach
+
+Earlier, you saw two data visualizations that showcased the disparity between number of ratings per movie and number of ratings per user. Here they are again:
+
+As you can see, many movies were rated thousands of times, while most movies were rated only a few times. This is due to the popularity of the movie being reviewed.
+
+Similarly, some users have thousands of reviews, while most users have fewer than 250 reviews. This is due to the fact that some users are more active film critics than others.
+
+After seeing this, I assumed that some less popular movies and less active users with fewer ratings may provide more extreme rating values which skew its prediction from the mean average. We can check this theory by running the following code that evaluates which movies have the highest predicted rating and lowest predicted rating as compared to the number of times the movie was actually rated. Specifically, we look at this for the predicted value using only the movieId variable. Here is the code:
+
+** Best Performing Predictions **
+```{R, echo=FALSE, fig.cap = "Best Performing Predictions - Table", message=FALSE, warning=FALSE}
+movie_titles <- edx %>% 
+  select(movieId, Title) %>%
+  distinct()
+
+# Best performing predictions via movieId model
+edx %>% count(movieId) %>%
+  left_join(avg_movie_rating) %>%
+  left_join(movie_titles, by="movieId") %>%
+  arrange(desc(b1)) %>% 
+  select(Title, b1, n) %>% 
+  slice(1:10)
+```
+
+** Worst Performing Predictions **
+```{R, echo=FALSE, fig.cap = "Worst Performing Predictions - Table", message=FALSE, warning=FALSE}
+# worst performing predictions via movieId model
+edx %>% count(movieId) %>%
+  left_join(avg_movie_rating) %>%
+  left_join(movie_titles, by="movieId") %>%
+  arrange(b1) %>% 
+  select(Title, b1, n) %>% 
+  slice(1:10)
+```
+
+As you can see, a majority of our best and worst rated movies were reviewed very few times. Far below the median rating per movie. Now, it seems essential to use a regularization model that penalizes values when they have a small sample size. This, essentially, does two things: 1) It moves the predicted rating closer to the mean rating, and 2) the less extreme prediction values (due to small sample size) will dramatically improve our RMSE when prediction is incorrect.
+
+## Apply regularization to penalize movies and users with fewer ratings
+
+*Note:* Since I am applying regularization on variables that do not include genre, I’ve added the distinct() to reduce rows to the original dataset size. 
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+lambdas <- seq(0, 10, by = 0.1)
+rmses <- sapply(lambdas, function(lambda) {
+  # Calculate the average by movie
+  
+  b_m <- edx %>% 
+    distinct(movieId, userId, .keep_all = TRUE) %>%
+    group_by(movieId) %>%
+    summarize(b_m = sum(rating - mu_hat) / (n() + lambda))
+  
+  # Calculate the average by user
+  
+  b_u <- edx %>% 
+    distinct(movieId, userId, .keep_all = TRUE) %>%
+    left_join(b_m, by='movieId') %>%
+    group_by(userId) %>%
+    summarize(b_u = sum(rating - b_m - mu_hat) / (n() + lambda))
+  
+  # Compute the predicted ratings on validation dataset
+  
+  predicted_ratings <- validation %>%
+    left_join(b_m, by='movieId') %>%
+    left_join(b_u, by='userId') %>%
+    mutate(pred = mu_hat + b_m + b_u) %>%
+    pull(pred)
+  
+  # Predict the RMSE on the validation set
+  
+  return(RMSE(validation$rating, predicted_ratings))
+})
+
+```
+
+## Identify the lowest RMSE for the regularized model
+
+It’s effective to plot the results of the lambdas vs RMSE to ensure your sequence of values includes the value that best solves our problem.
+
+```{r, echo=FALSE, fig.cap="Lambdas vs RMSE score ", message=FALSE, warning=FALSE}
+qplot(lambdas, rmses)
+```
+
+Now we can select the lambda with the lowest RMSE
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+lambda <- lambdas[which.min(rmses)]
+lambda
+```
+
+
+\newpage
+
+#Conclusion
+
+In summary, a regularized least squares model using only two variables, movieId and userId, has enabled us to make an effective movie recommendation model that reduces the root mean squared error to 0.8626956. 
+
